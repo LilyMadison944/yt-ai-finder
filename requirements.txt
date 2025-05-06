@@ -1,6 +1,7 @@
-flask==3.0.3
-gunicorn==22.0.0
-youtube_transcript_api==0.6.2
-google-api-python-client==2.149.0
-nltk==3.9.1
-numpy==2.1.1
+fastapi
+uvicorn
+youtube-transcript-api
+google-api-python-client
+transformers
+torch
+nltk
