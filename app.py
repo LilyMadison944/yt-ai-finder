@@ -4,12 +4,13 @@ from flask import Flask, request, jsonify
 import googleapiclient.discovery
 import googleapiclient.errors
 from youtube_transcript_api import YouTubeTranscriptApi
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 import nltk
-from nltk.tokenize import sent_tokenize
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
 import re
 import numpy as np
 import logging
+from collections import defaultdict
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Download NLTK data
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('stopwords', quiet=True)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -29,18 +32,9 @@ if not YOUTUBE_API_KEY:
     raise ValueError("YOUTUBE_API_KEY is required.")
 youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
-# Initialize NLP models (force CPU)
-device = -1  # -1 for CPU
-relevance_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-relevance_model = AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased-finetuned-sst-2-english"
-)
-summarizer = pipeline(
-    "summarization", model="facebook/bart-large-cnn", device=device, max_length=100, min_length=30
-)
-sentiment_analyzer = pipeline(
-    "sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=device
-)
+# Simple sentiment analysis word lists
+POSITIVE_WORDS = {'good', 'great', 'awesome', 'excellent', 'helpful', 'clear', 'amazing', 'love', 'fantastic'}
+NEGATIVE_WORDS = {'bad', 'poor', 'terrible', 'awful', 'confusing', 'useless', 'horrible', 'hate', 'worst'}
 
 def generate_search_queries(prompt):
     """Generate three YouTube search queries from the user prompt."""
@@ -87,28 +81,79 @@ def fetch_transcript(video_id):
         return None
 
 def analyze_relevance(transcript, prompt):
-    """Analyze transcript relevance to the prompt using DistilBERT."""
+    """Analyze transcript relevance using keyword overlap."""
     if not transcript:
         return 0.0
-    inputs = relevance_tokenizer(
-        prompt, transcript, return_tensors="pt", truncation=True, max_length=256
-    )
-    outputs = relevance_model(**inputs)
-    score = outputs.logits.softmax(dim=1)[0][1].item()
-    return score
+    prompt_words = set(word_tokenize(prompt.lower()))
+    transcript_words = set(word_tokenize(transcript.lower()))
+    common_words = prompt_words.intersection(transcript_words)
+    return len(common_words) / max(len(prompt_words), 1)  # Normalize by prompt length
 
 def summarize_transcript(transcript):
-    """Generate a summary of the transcript."""
+    """Generate a summary of at least 500 characters using frequency-based extractive summarization."""
     if not transcript:
         return "No transcript available."
+    
     try:
+        # Tokenize sentences
         sentences = sent_tokenize(transcript)
-        text = " ".join(sentences[:5])
-        summary = summarizer(text, do_sample=False)[0]["summary_text"]
-        return summary
+        if not sentences:
+            return transcript[:500] + ("..." if len(transcript) > 500 else "") or "No transcript available."
+        
+        # Tokenize words and remove stopwords
+        stop_words = set(stopwords.words('english'))
+        word_freq = defaultdict(int)
+        for sentence in sentences:
+            words = word_tokenize(sentence.lower())
+            for word in words:
+                if word.isalnum() and word not in stop_words:
+                    word_freq[word] += 1
+        
+        # Score sentences based on word frequency
+        sentence_scores = []
+        for sentence in sentences:
+            score = sum(word_freq[word.lower()] for word in word_tokenize(sentence) if word.isalnum() and word.lower() not in stop_words)
+            sentence_scores.append((sentence, score / max(len(word_tokenize(sentence)), 1)))
+        
+        # Sort sentences by score
+        sorted_sentences = [sentence for sentence, _ in sorted(sentence_scores, key=lambda x: x[1], reverse=True)]
+        
+        # Select sentences until summary is at least 500 characters
+        summary = []
+        char_count = 0
+        for sentence in sorted_sentences:
+            summary.append(sentence)
+            char_count += len(sentence)
+            if char_count >= 500:
+                break
+        
+        # If summary is too short, add more sentences
+        if char_count < 500 and len(summary) < len(sentences):
+            remaining_sentences = [s for s in sentences if s not in summary]
+            for sentence in remaining_sentences:
+                summary.append(sentence)
+                char_count += len(sentence)
+                if char_count >= 500:
+                    break
+        
+        # Join sentences and ensure at least 500 characters (truncate or pad if needed)
+        summary_text = " ".join(summary)
+        if len(summary_text) < 500 and len(transcript) >= 500:
+            summary_text = transcript[:500] + "..."
+        elif len(summary_text) < 500 and len(transcript) < 500:
+            summary_text = transcript  # Use full transcript if too short
+        
+        return summary_text
     except Exception as e:
         logger.warning(f"Summarization error: {e}")
-        return "Summary unavailable."
+        return transcript[:500] + ("..." if len(transcript) > 500 else "") or "No transcript available."
+
+def analyze_sentiment(comment):
+    """Simple rule-based sentiment analysis."""
+    words = set(word_tokenize(comment.lower()))
+    positive_count = len(words.intersection(POSITIVE_WORDS))
+    negative_count = len(words.intersection(NEGATIVE_WORDS))
+    return 1 if positive_count > negative_count else -1 if negative_count > positive_count else 0
 
 def fetch_comments_and_likes(video_id):
     """Fetch total likes, top 3 comments, and analyze comment sentiment."""
@@ -132,8 +177,7 @@ def fetch_comments_and_likes(video_id):
             comments.append(comment)
             comment_texts.append(comment)
         
-        sentiments = sentiment_analyzer(comment_texts) if comment_texts else []
-        sentiment_scores = [1 if s["label"] == "POSITIVE" else -1 for s in sentiments]
+        sentiment_scores = [analyze_sentiment(comment) for comment in comment_texts]
         avg_sentiment = np.mean(sentiment_scores) if sentiment_scores else 0.0
         
         return {
@@ -198,7 +242,7 @@ def find_videos():
                 "search_query": video["search_query"]
             })
         
-        results = sorted(results, key=lambda x: x["relevance_score"], reverse=True)
+        results = sorted(results, key=lambda x: x[1], reverse=True)
         logger.info(f"Returning {len(results[:5])} videos for prompt: {prompt}")
         return jsonify({
             "prompt": prompt,
