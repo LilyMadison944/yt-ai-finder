@@ -3,4 +3,3 @@ requests
 yt-dlp
 nltk
 sentence-transformers
-python-dotenv
