@@ -2,387 +2,297 @@ import streamlit as st
 import re
 import os
 import time
-import random
-import nltk
-import cv2 # OpenCV for video processing
-import numpy as np
+import requests
 import string
-from sentence_transformers import SentenceTransformer, util
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 import yt_dlp
+from pathlib import Path
 from dotenv import load_dotenv
-from io import BytesIO # <--- FIX: Added for in-memory file handling
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="YouTube Content AI",
-    page_icon="🎬",
-    layout="wide"
-)
+# --- NLTK and SentenceTransformer Imports ---
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from sentence_transformers import SentenceTransformer, util
 
-# --- Load Environment Variables & NLTK Data ---
+# --- ⚙️ App Configuration & Setup ---
+st.set_page_config(page_title="AI YouTube Content Finder", layout="wide")
+
+# Load API Key from .env file
 load_dotenv()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-COOKIES_FILE = "cookies.txt"
+API_KEY = os.getenv("RAPIDAPI_KEY")
 
+# --- CHANGE: Added a list of categories to ignore ---
+# 10 is the ID for the "Music" category on YouTube.
+DISALLOWED_CATEGORIES = ['10']
+
+# --- Enhanced Logging for Debug Mode ---
+def log_message(message, data=None):
+    if st.session_state.get("debug_mode", False):
+        log_entry = f"[{time.strftime('%H:%M:%S')}] {message}"
+        if data:
+            import json
+            log_entry += f"\n└── DATA: {json.dumps(data, indent=2)}\n"
+        st.session_state.logs.append(log_entry)
+
+# Initialize Streamlit Session State
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+if "videos" not in st.session_state:
+    st.session_state.videos = None
+if "selected_video_for_shorts" not in st.session_state:
+    st.session_state.selected_video_for_shorts = None
+
+# --- Helper Function for NLTK Downloads ---
 @st.cache_resource
 def download_nltk_data():
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords', quiet=True)
-    try:
-        nltk.data.find('corpora/wordnet')
-    except LookupError:
-        nltk.download('wordnet', quiet=True)
+    nltk_data_path = os.path.expanduser("~/nltk_data")
+    if not os.path.exists(nltk_data_path):
+        os.makedirs(nltk_data_path)
+    nltk.data.path.append(nltk_data_path)
+    for resource in ['punkt', 'stopwords', 'wordnet']:
+        try:
+            nltk.data.find(f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}')
+        except LookupError:
+            nltk.download(resource, quiet=True, download_dir=nltk_data_path)
+
 download_nltk_data()
 
-# --- Caching for Performance ---
+# --- Load SentenceTransformer Model ---
 @st.cache_resource
-def load_sentence_model():
-    """Loads the SentenceTransformer model once and caches it."""
+def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-@st.cache_data
-def get_authenticated_service():
-    """Authenticates with the YouTube API and caches the service object."""
-    if not YOUTUBE_API_KEY:
-        st.error("YouTube API key not found. Please add it to your .env file.")
-        st.stop()
-    try:
-        return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-    except Exception as e:
-        st.error(f"Failed to initialize YouTube API: {e}")
-        st.stop()
+model = load_model()
 
-# --- Core Logic Functions (Adapted for Streamlit) ---
-
+# --- Backend Core Functions ---
 def clean_text(text):
     if not text: return ""
-    text = re.sub(r'\b(uh|um|like|you know)\b', '', text, flags=re.IGNORECASE)
-    text = text.lower().translate(str.maketrans("", "", string.punctuation))
-    tokens = nltk.word_tokenize(text)
-    stop_words = set(nltk.corpus.stopwords.words('english')) - {'how', 'make', 'money', 'online', 'podcast'}
-    lemmatizer = nltk.stem.WordNetLemmatizer()
-    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words]
+    text = re.sub(r'\[.*?\]', '', text).lower()
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    tokens = word_tokenize(text)
+    stop_words = set(stopwords.words('english'))
+    tokens = [WordNetLemmatizer().lemmatize(w) for w in tokens if w.isalpha() and w not in stop_words]
     return " ".join(tokens)
 
-@st.cache_data
-def search_and_analyze_videos(_youtube_service, query):
-    """Searches and analyzes videos, caching the results for a given query."""
-    status_area = st.empty()
-    
+def search_videos_api(query, max_results=15): # Fetch more to have buffer for filtering
+    url = "https://youtube-v311.p.rapidapi.com/search/"
+    headers = {"x-rapidapi-key": API_KEY, "x-rapidapi-host": "youtube-v311.p.rapidapi.com"}
+    params = {"q": query, "part": "snippet", "maxResults": max_results, "type": "video"}
+    log_message("➡️ Sending Search Request to API...", data=params)
+
     try:
-        # 1. Search for videos
-        status_area.info("🔎 Searching for top 10 relevant videos...")
-        search_response = _youtube_service.search().list(q=query, part="id,snippet", maxResults=10, type="video").execute()
-        video_items = search_response.get("items", [])
-        if not video_items:
-            st.warning("No videos found for this query.")
-            return []
-        
-        video_ids = [item["id"]["videoId"] for item in video_items]
-        video_response = _youtube_service.videos().list(part="statistics", id=",".join(video_ids)).execute()
-        stats_dict = {item['id']: item['statistics'] for item in video_response['items']}
-
-        videos = []
-        for item in video_items:
-            video_id = item["id"]["videoId"]
-            stats = stats_dict.get(video_id, {})
-            videos.append({
-                "video_id": video_id, "title": item["snippet"]["title"],
-                "likes": int(stats.get("likeCount", 0)), "views": int(stats.get("viewCount", 0))
-            })
-
-        # 2. Analyze videos
-        video_data = []
-        progress_bar = st.progress(0, text="Analyzing videos...")
-        for i, video in enumerate(videos):
-            status_area.info(f"🧐 Analyzing video {i+1}/{len(videos)}: {video['title'][:40]}...")
-            time.sleep(random.uniform(0.5, 1.5)) # Rate limiting
-            
-            ydl_opts = {'skip_download': True, 'writeautomaticsub': True, 'subtitleslangs': ['en'], 'subtitlesformat': 'vtt', 'outtmpl': f'/tmp/{video["video_id"]}.%(ext)s', 'quiet': True, 'no_warnings': True}
-            if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-            
-            vtt_file = f'/tmp/{video["video_id"]}.en.vtt'
-            captions = ""
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={video['video_id']}"])
-                if os.path.exists(vtt_file):
-                    with open(vtt_file, "r", encoding="utf-8") as f: captions = f.read()
-                    captions = re.sub(r'WEBVTT\n.*?\n\n', '', captions)
-                    captions = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', captions)
-                    captions = re.sub(r'<[^>]+>', '', captions).strip()
-                    captions = re.sub(r'\n+', ' ', captions)
-            finally:
-                if os.path.exists(vtt_file): os.remove(vtt_file)
-
-            combined_text = clean_text(video['title'] + " " + captions)
-            if combined_text:
-                video_data.append({"video_id": video["video_id"], "title": video["title"], "captions": combined_text, "likes": video["likes"], "views": video["views"]})
-            progress_bar.progress((i + 1) / len(videos), text=f"Analyzing video {i+1}/{len(videos)}")
-        
-        status_area.info("🤖 Calculating relevance scores...")
-        model = load_sentence_model()
-        query_embedding = model.encode(clean_text(query))
-        caption_embeddings = model.encode([v["captions"] for v in video_data])
-        sim_scores = util.cos_sim(query_embedding, caption_embeddings)[0]
-
-        for i, video in enumerate(video_data):
-            rel_score = sim_scores[i].item() * 100
-            like_ratio = (video["likes"] / (video["views"] + 1)) * 100
-            video["relevance_score"] = rel_score
-            video["composite_score"] = (0.7 * rel_score) + (0.3 * like_ratio)
-        
-        video_data.sort(key=lambda x: x['composite_score'], reverse=True)
-        status_area.empty()
-        return video_data[:5]
-        
-    except HttpError as e:
-        if "quota" in str(e).lower():
-            st.error("YouTube API Quota Exceeded. Please check your API key or try again tomorrow.")
-        else:
-            st.error(f"An API error occurred: {e}")
-        return []
-    except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        result = response.json()
+        log_message(f"✅ API Search Success. Found {len(result.get('items', []))} items.")
+        return result.get('items', [])
+    except requests.exceptions.RequestException as e:
+        st.error(f"API Search Error: {e}")
+        log_message(f"🔴 API Search Error", data=str(e))
         return []
 
-# --- ✨ Thumbnail & Download Features ✨ ---
-
-def get_frame_at_timestamp(video_url, timestamp_seconds):
-    """Captures a single frame from a video URL at a specific timestamp."""
+def get_video_info(video_id):
+    url = "https://youtube-v311.p.rapidapi.com/videos/"
+    headers = {"x-rapidapi-key": API_KEY, "x-rapidapi-host": "youtube-v311.p.rapidapi.com"}
+    params = {"part": "snippet,statistics", "id": video_id}
+    log_message(f"➡️ Fetching Video Info for ID: {video_id}", data=params)
     try:
-        ydl_opts = {'format': 'best[ext=mp4][height<=480]/best[height<=480]', 'quiet': True}
-        if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-            
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            stream_url = info['url']
-
-        cap = cv2.VideoCapture(stream_url)
-        if not cap.isOpened(): return None
-        
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_seconds * 1000)
-        success, frame = cap.read()
-        cap.release()
-        
-        if success:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return None
-    except Exception as e:
-        print(f"Frame capture error: {e}")
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        info = response.json().get('items', [{}])[0]
+        # --- CHANGE: Log the category ID ---
+        cat_id = info.get('snippet', {}).get('categoryId', 'N/A')
+        log_message(f"✅ Fetched Info for '{info.get('snippet', {}).get('title', 'N/A')}' (Category ID: {cat_id})")
+        return info
+    except requests.exceptions.RequestException as e:
+        log_message(f"🔴 Failed to fetch info for {video_id}", data=str(e))
         return None
 
-def format_time(seconds):
-    return f"{int(seconds // 60):02}:{int(seconds % 60):02}"
-
-# --- ✨ NEW: Function to download video segment ✨ ---
-def download_short_segment(video_id, start_time, end_time, title):
-    """Downloads a specific segment of a YouTube video and returns it as bytes."""
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-    temp_filename = f"temp_{video_id}_{int(start_time)}.mp4"
-    
-    ydl_opts = {
-        'format': 'best[ext=mp4][height<=720]/best[ext=mp4]',
-        'outtmpl': temp_filename,
-        'quiet': True,
-        'no_warnings': True,
-        # Using ffmpeg to cut the video segment
-        'postprocessor_args': [
-            '-ss', str(start_time),
-            '-to', str(end_time),
-            '-c:v', 'libx264', '-c:a', 'aac'
-        ],
-    }
-    if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-
+def get_timed_transcript(video_id):
+    log_message(f"⏳ Fetching captions for video ID: {video_id} using yt-dlp...")
+    ydl_opts = {'writesubtitles': True, 'writeautomaticsub': True, 'subtitleslangs': ['en'], 'skip_download': True, 'outtmpl': f'subtitles/%(id)s'}
+    Path("subtitles").mkdir(exist_ok=True)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-
-        if os.path.exists(temp_filename):
-            with open(temp_filename, 'rb') as f:
-                video_bytes = f.read()
-            os.remove(temp_filename)
-            return video_bytes
-        else:
-            st.error("Download failed. Could not create video clip.")
+            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+        
+        vtt_file_path = next(Path("subtitles").glob(f"{video_id}.*.vtt"), None)
+        if not vtt_file_path:
+            log_message("🔴 VTT caption file not found.")
             return None
+        
+        with open(vtt_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        transcript_data = []
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                try:
+                    start, end = line.strip().split(" --> ")
+                    text = lines[i+1].strip()
+                    start_s = sum(x * float(t) for x, t in zip([3600, 60, 1], start.split('.')[0].split(':'))) + float("0." + start.split('.')[-1])
+                    transcript_data.append({"start": start_s, "text": text})
+                except (ValueError, IndexError):
+                    continue
+        
+        log_message(f"✅ Captions parsed. Segments: {len(transcript_data)}")
+        os.remove(vtt_file_path)
+        return transcript_data
     except Exception as e:
-        st.error(f"An error occurred during download: {e}")
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+        log_message(f"🔴 Error fetching transcript with yt-dlp", data=str(e))
         return None
 
-@st.cache_data
-def generate_short_ideas(_video_id, query):
-    """Generates short ideas and captures a thumbnail for each."""
-    video_url = f"https://www.youtube.com/watch?v={_video_id}"
-    ydl_opts = {'skip_download': True, 'writesubtitles': True, 'writeautomaticsub': True, 'subtitleslangs': ['en'], 'subtitlesformat': 'vtt', 'outtmpl': f'/tmp/{_video_id}.%(ext)s', 'quiet': True, 'no_warnings': True}
-    if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-    vtt_file = f'/tmp/{_video_id}.en.vtt'
-    if os.path.exists(vtt_file): os.remove(vtt_file)
+def find_best_clips(transcript, query, clip_duration=58, num_clips=3):
+    log_message("🧠 Analyzing transcript to find best clips...")
+    if not transcript or len(transcript) < 2: return []
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([video_url])
-        if not os.path.exists(vtt_file): return []
-        
-        with open(vtt_file, "r", encoding="utf-8") as f: lines = f.read().splitlines()
-        
-        timed_lines = []
-        for i, line in enumerate(lines):
-            if '-->' in line:
-                try:
-                    start_str, _ = line.split(' --> ')
-                    h, m, s_ms = start_str.split(':')
-                    s, ms = s_ms.split('.')
-                    start_time = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
-                    caption_text = re.sub(r'<[^>]+>', '', lines[i + 1]).strip()
-                    if caption_text: timed_lines.append({"text": caption_text, "start": start_time})
-                except (ValueError, IndexError): continue
-
-        chunks = []
-        for i in range(len(timed_lines)):
-            start_line = timed_lines[i]
-            current_text = ""
-            for j in range(i, len(timed_lines)):
-                line = timed_lines[j]
-                end_time = line['start']
-                duration = end_time - start_line['start']
-                if 20 <= duration <= 60:
-                    current_text += " " + line['text']
-                    if len(clean_text(current_text)) > 15:
-                        chunks.append({"text": current_text.strip(), "start": start_line['start'], "end": end_time})
-                    break
-                current_text += " " + line['text']
-
-        if not chunks: return []
-        
-        model = load_sentence_model()
-        query_embedding = model.encode(clean_text(query))
-        chunk_embeddings = model.encode([clean_text(c['text']) for c in chunks])
-        similarities = util.cos_sim(query_embedding, chunk_embeddings)[0]
-        for i, chunk in enumerate(chunks): chunk['score'] = similarities[i].item()
-
-        sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
-        final_shorts = []
-        for chunk in sorted_chunks:
-            if len(final_shorts) >= 3: break
-            if not any(abs(chunk['start'] - chosen['start']) < 60 for chosen in final_shorts):
-                final_shorts.append(chunk)
-
-        # Generate thumbnails for the final selection
-        for short in final_shorts:
-            thumbnail_timestamp = short['start'] + (short['end'] - short['start']) / 2
-            short['thumbnail'] = get_frame_at_timestamp(video_url, thumbnail_timestamp)
-        
-        return final_shorts
-
-    finally:
-        if os.path.exists(vtt_file): os.remove(vtt_file)
-
-# --- Streamlit UI ---
-
-st.title("🎬 YouTube Content AI")
-st.markdown("Discover the most relevant videos for your topic and generate viral Short ideas in one click.")
-
-if not os.path.exists(COOKIES_FILE):
-    st.warning(f"For best results, place your `cookies.txt` file in the same directory as this app.")
-
-# Initialize session state
-if 'relevant_videos' not in st.session_state:
-    st.session_state.relevant_videos = None
-if 'query' not in st.session_state:
-    st.session_state.query = ""
-if 'shorts_to_generate' not in st.session_state:
-    st.session_state.shorts_to_generate = None
-
-# --- Search Bar ---
-query = st.text_input("Enter a topic or keyword", placeholder="e.g., how to start a successful podcast")
-if st.button("Search Videos", type="primary") and query:
-    st.session_state.query = query
-    # Clear previous shorts when a new search is made
-    st.session_state.shorts_to_generate = None 
-    st.session_state.relevant_videos = search_and_analyze_videos(get_authenticated_service(), query)
-
-# --- Display Results ---
-if st.session_state.relevant_videos:
-    st.header("🏆 Top 5 Recommended Videos")
-    for video in st.session_state.relevant_videos:
-        video_url = f"https://www.youtube.com/watch?v={video['video_id']}"
-        with st.container(border=True):
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                st.image(f"https://i.ytimg.com/vi/{video['video_id']}/hqdefault.jpg")
-            with col2:
-                st.subheader(f"[{video['title']}]({video_url})")
-                st.caption(f"**Views:** {video['views']:,} | **Likes:** {video['likes']:,} | **Relevance:** {video['relevance_score']:.0f}/100")
-                if st.button("💡 Generate Short Ideas", key=video['video_id']):
-                    st.session_state.shorts_to_generate = video
-                    # Use st.rerun() for a smoother state update
-                    st.rerun()
-                        
-# --- Display Generated Shorts ---
-if 'shorts_to_generate' in st.session_state and st.session_state.shorts_to_generate:
-    video = st.session_state.shorts_to_generate
-    st.header(f"💡 Short Ideas for: *{video['title']}*")
+    clean_query = clean_text(query)
+    query_embedding = model.encode(clean_query, convert_to_tensor=True)
     
-    with st.spinner("Analyzing video transcript and generating thumbnails... This can take a minute."):
-        short_ideas = generate_short_ideas(video['video_id'], st.session_state.query)
+    potential_clips = []
+    for i in range(len(transcript)):
+        start_time = transcript[i]['start']
+        end_time = start_time + clip_duration
+        current_chunk_texts = [t['text'] for t in transcript if start_time <= t['start'] < end_time and not t['text'].startswith('[')]
+        
+        if current_chunk_texts:
+            potential_clips.append({"start": start_time, "end": end_time, "transcript": " ".join(current_chunk_texts)})
 
-    if not short_ideas:
-        st.error("Could not generate any short ideas. The video may not have captions or enough relevant content.")
+    if not potential_clips: return []
+
+    clip_texts = [clean_text(c['transcript']) for c in potential_clips]
+    clip_embeddings = model.encode(clip_texts, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(query_embedding, clip_embeddings)
+    
+    for i, clip in enumerate(potential_clips):
+        clip['score'] = cosine_scores[0][i].item()
+
+    potential_clips.sort(key=lambda x: x['score'], reverse=True)
+    
+    final_clips = []
+    for clip in potential_clips:
+        if not any(max(clip['start'], fc['start']) < min(clip['end'], fc['end']) for fc in final_clips):
+            final_clips.append(clip)
+        if len(final_clips) == num_clips:
+            break
+            
+    log_message(f"✅ Found {len(final_clips)} potential clips.")
+    return final_clips
+
+# --- 🖼️ Streamlit UI ---
+st.title("AI YouTube Content Finder")
+st.markdown("Your intelligent guide to clickbait-free content and instant video highlights.")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.session_state.debug_mode = st.checkbox("Enable Debug Mode")
+    if st.session_state.debug_mode:
+        st.subheader("📝 Debug Logs")
+        if st.button("Clear Logs"):
+            st.session_state.logs = []
+        log_container = st.container(height=400)
+        log_container.text("\n".join(st.session_state.logs[::-1]))
+
+search_query = st.text_input("Enter your search query:", placeholder="e.g., how to make money using rapidapi")
+
+if st.button("Analyze Content", type="primary"):
+    if not API_KEY:
+        st.error("RAPIDAPI_KEY not found in your .env file. Please create it.")
+    elif not search_query:
+        st.error("Please enter a search query.")
     else:
-        # Check if number of ideas is less than 3 to avoid layout errors
-        num_shorts = len(short_ideas)
-        cols = st.columns(num_shorts if num_shorts > 0 else 1)
+        st.session_state.logs = []
+        log_message("--- 🚀 Starting New Analysis ---")
+        
+        with st.spinner("Finding and analyzing relevant videos..."):
+            search_results = search_videos_api(search_query)
+            if not search_results:
+                st.warning("No videos found for this query.")
+                st.stop()
+            
+            all_video_details = []
+            for item in search_results:
+                video_id = item['id']['videoId']
+                info = get_video_info(video_id)
+                if info:
+                    # --- CHANGE: Filter out disallowed categories ---
+                    category_id = info.get('snippet', {}).get('categoryId')
+                    if category_id in DISALLOWED_CATEGORIES:
+                        log_message(f"🚫 Skipping video '{info['snippet']['title']}' due to disallowed category: {category_id}")
+                        continue # Move to the next video
 
-        for i, short in enumerate(short_ideas):
-            with cols[i]:
-                with st.container(border=True):
-                    if short['thumbnail'] is not None:
-                        st.image(short['thumbnail'], caption=f"Frame from {format_time(short['start'])}")
-                    else:
-                        st.image(f"https://i.ytimg.com/vi/{video['video_id']}/hqdefault.jpg", caption="Could not generate thumbnail")
-                    
-                    st.markdown(f"**🕒 Timestamp:** `{format_time(short['start'])} - {format_time(short['end'])}`")
-                    st.markdown(f"**💬 Transcript:** *\"{short['text']}\"*")
+                    transcript = get_timed_transcript(video_id)
+                    details = {
+                        "video_id": video_id,
+                        "title": info['snippet']['title'],
+                        "description": info['snippet']['description'],
+                        "thumbnail": info['snippet']['thumbnails']['high']['url'],
+                        "views": int(info['statistics'].get('viewCount', 0)),
+                        "likes": int(info['statistics'].get('likeCount', 0)),
+                        "transcript": transcript
+                    }
+                    all_video_details.append(details)
+            
+            if not all_video_details:
+                st.error("Could not fetch details for any relevant videos.")
+                st.stop()
 
-                    # --- ✨ NEW: "Open in new tab" link ✨ ---
-                    timestamp_url = f"https://www.youtube.com/watch?v={video['video_id']}&t={int(short['start'])}s"
-                    st.markdown(f'<a href="{timestamp_url}" target="_blank">🔗 Open in new tab</a>', unsafe_allow_html=True)
-                    
-                    # --- ✨ NEW: Download Button ✨ ---
-                    # The download logic is handled by a button click which will re-run the script.
-                    # We prepare the data for the download button.
-                    placeholder = st.empty()
-                    with placeholder.container():
-                        if st.button(f"📥 Download Clip {i+1}", key=f"download_{video['video_id']}_{i}"):
-                            with st.spinner("Preparing your download..."):
-                                video_bytes = download_short_segment(video['video_id'], short['start'], short['end'], video['title'])
-                                if video_bytes:
-                                    # When the download is ready, we replace the button with a download_button
-                                    # We need to use session state to manage this transition
-                                    st.session_state[f'video_bytes_{i}'] = video_bytes
-                    
-                    # If the bytes are in the session state, show the actual download button
-                    if f'video_bytes_{i}' in st.session_state:
-                        video_bytes_data = st.session_state.pop(f'video_bytes_{i}') # Use pop to clear state after use
+            log_message("⚖️ Calculating relevance scores...")
+            query_embedding = model.encode(clean_text(search_query))
+            for video in all_video_details:
+                # Only score videos that have a transcript
+                if video['transcript']:
+                    combined_text = video['title'] + " " + video['description'] + " " + " ".join([t['text'] for t in video['transcript']])
+                    content_embedding = model.encode(clean_text(combined_text))
+                    sim_score = util.cos_sim(query_embedding, content_embedding)[0].item()
+                    like_ratio = (video.get("likes", 0) / (video.get("views", 1) + 1)) * 1000
+                    video["composite_score"] = (0.8 * sim_score * 100) + (0.2 * like_ratio)
+                else:
+                    video["composite_score"] = 0 # Give no score if no transcript
+            
+            all_video_details.sort(key=lambda x: x['composite_score'], reverse=True)
+            st.session_state.videos = all_video_details[:5]
+            log_message("✅ Analysis complete. Top 5 videos identified.")
+
+if st.session_state.videos:
+    st.header("🏆 Top 5 Relevant Videos")
+    for i, video in enumerate(st.session_state.videos):
+        if video['composite_score'] == 0: continue # Don't show videos that couldn't be scored
+        with st.container(border=True):
+            col1, col2 = st.columns([1, 3])
+            col1.image(video['thumbnail'])
+            col2.subheader(f"{i+1}. {video['title']}")
+            col2.caption(f"🔗 https://www.youtube.com/watch?v={video['video_id']} |  score: {video['composite_score']:.2f}")
+            col2.markdown(f"👀 **Views:** {video['views']:,} | 👍 **Likes:** {video['likes']:,}")
+            
+            if col2.button("✨ Generate Short Ideas", key=f"shorts_{video['video_id']}"):
+                st.session_state.selected_video_for_shorts = video
+                st.rerun()
+
+if st.session_state.selected_video_for_shorts:
+    video = st.session_state.selected_video_for_shorts
+    st.header(f"💡 Generated Ideas for: {video['title']}")
+
+    transcript_data = video['transcript']
+    
+    with st.spinner("Finding the best clips..."):
+        if transcript_data:
+            clips = find_best_clips(transcript_data, search_query)
+            if clips:
+                cols = st.columns(len(clips))
+                for i, col in enumerate(cols):
+                    with col:
+                        clip_data = clips[i]
+                        start_time = clip_data['start']
+                        end_time = clip_data['end']
                         
-                        # Sanitize title for filename
-                        safe_title = re.sub(r'[^\w\s-]', '', video['title']).strip()
-                        safe_title = re.sub(r'[-\s]+', '-', safe_title)
-                        
-                        placeholder.download_button(
-                            label=f"✅ Click to Save Clip {i+1}",
-                            data=video_bytes_data,
-                            file_name=f"{safe_title}_short_{i+1}.mp4",
-                            mime="video/mp4",
-                            key=f"final_download_{video['video_id']}_{i}"
-                        )
+                        st.subheader(f"Idea #{i+1}")
+                        st.image(video['thumbnail'])
+                        st.markdown(f"**Timestamp:** `{time.strftime('%M:%S', time.gmtime(start_time))}` to `{time.strftime('%M:%S', time.gmtime(end_time))}`")
+                        with st.expander("Show Transcript"):
+                            st.text(clip_data['transcript'])
+            else:
+                st.error("Could not find any relevant clips in this video's transcript.")
+        else:
+            st.error("No captions were found for this video. Unable to generate ideas.")
