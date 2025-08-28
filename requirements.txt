@@ -1,11 +1,8 @@
 streamlit
+requests
+yt-dlp
+ffmpeg-python
 opencv-python-headless
+pandas
 nltk
 sentence-transformers
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-yt-dlp
-python-dotenv
-requests
