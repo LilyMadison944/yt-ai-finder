@@ -1,7 +1,11 @@
-fastapi
-uvicorn
-youtube-transcript-api
-google-api-python-client
-transformers
-torch
+streamlit
+opencv-python-headless
 nltk
+sentence-transformers
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+yt-dlp
+python-dotenv
+requests
