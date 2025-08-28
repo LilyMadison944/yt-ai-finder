@@ -6,8 +6,7 @@ import requests
 import string
 import yt_dlp
 from pathlib import Path
-from dotenv import load_dotenv
-
+import os
 # --- NLTK and SentenceTransformer Imports ---
 import nltk
 from nltk.tokenize import word_tokenize
@@ -19,7 +18,6 @@ from sentence_transformers import SentenceTransformer, util
 st.set_page_config(page_title="AI YouTube Content Finder", layout="wide")
 
 # Load API Key from .env file
-load_dotenv()
 API_KEY = os.getenv("RAPIDAPI_KEY")
 
 # --- CHANGE: Added a list of categories to ignore ---
