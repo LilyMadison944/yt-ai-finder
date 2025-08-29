@@ -6,7 +6,7 @@ import requests
 import string
 import yt_dlp
 from pathlib import Path
-import os
+
 # --- NLTK and SentenceTransformer Imports ---
 import nltk
 from nltk.tokenize import word_tokenize
@@ -17,10 +17,16 @@ from sentence_transformers import SentenceTransformer, util
 # --- ⚙️ App Configuration & Setup ---
 st.set_page_config(page_title="AI YouTube Content Finder", layout="wide")
 
-# Load API Key from .env file
+# Get API key from Streamlit secrets or local .env file
+# This will try to load from a local .env file if the library is installed
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass # Will fail silently if dotenv is not installed on the cloud
+
 API_KEY = os.getenv("RAPIDAPI_KEY")
 
-# --- CHANGE: Added a list of categories to ignore ---
 # 10 is the ID for the "Music" category on YouTube.
 DISALLOWED_CATEGORIES = ['10']
 
@@ -41,20 +47,25 @@ if "videos" not in st.session_state:
 if "selected_video_for_shorts" not in st.session_state:
     st.session_state.selected_video_for_shorts = None
 
-# --- Helper Function for NLTK Downloads ---
+# --- CHANGE: Simplified NLTK Download Function ---
 @st.cache_resource
 def download_nltk_data():
-    nltk_data_path = os.path.expanduser("~/nltk_data")
-    if not os.path.exists(nltk_data_path):
-        os.makedirs(nltk_data_path)
-    nltk.data.path.append(nltk_data_path)
-    for resource in ['punkt', 'stopwords', 'wordnet']:
-        try:
-            nltk.data.find(f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}')
-        except LookupError:
-            nltk.download(resource, quiet=True, download_dir=nltk_data_path)
+    """Downloads necessary NLTK models directly."""
+    log_message("Downloading NLTK data packages (punkt, stopwords, wordnet)...")
+    try:
+        nltk.download('punkt')
+        nltk.download('stopwords')
+        nltk.download('wordnet')
+        nltk.download('omw-1.4')
+        log_message("✅ NLTK data downloaded successfully.")
+        return True
+    except Exception as e:
+        log_message(f"🔴 Error downloading NLTK data: {e}")
+        st.error(f"Failed to download NLTK data: {e}")
+        return False
 
-download_nltk_data()
+# Call the function to ensure data is downloaded
+nltk_data_available = download_nltk_data()
 
 # --- Load SentenceTransformer Model ---
 @st.cache_resource
@@ -73,7 +84,7 @@ def clean_text(text):
     tokens = [WordNetLemmatizer().lemmatize(w) for w in tokens if w.isalpha() and w not in stop_words]
     return " ".join(tokens)
 
-def search_videos_api(query, max_results=15): # Fetch more to have buffer for filtering
+def search_videos_api(query, max_results=15):
     url = "https://youtube-v311.p.rapidapi.com/search/"
     headers = {"x-rapidapi-key": API_KEY, "x-rapidapi-host": "youtube-v311.p.rapidapi.com"}
     params = {"q": query, "part": "snippet", "maxResults": max_results, "type": "video"}
@@ -99,7 +110,6 @@ def get_video_info(video_id):
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         info = response.json().get('items', [{}])[0]
-        # --- CHANGE: Log the category ID ---
         cat_id = info.get('snippet', {}).get('categoryId', 'N/A')
         log_message(f"✅ Fetched Info for '{info.get('snippet', {}).get('title', 'N/A')}' (Category ID: {cat_id})")
         return info
@@ -194,9 +204,9 @@ with st.sidebar:
 
 search_query = st.text_input("Enter your search query:", placeholder="e.g., how to make money using rapidapi")
 
-if st.button("Analyze Content", type="primary"):
+if st.button("Analyze Content", type="primary") and nltk_data_available:
     if not API_KEY:
-        st.error("RAPIDAPI_KEY not found in your .env file. Please create it.")
+        st.error("RAPIDAPI_KEY not found. Please add it to your Streamlit secrets.")
     elif not search_query:
         st.error("Please enter a search query.")
     else:
@@ -214,11 +224,10 @@ if st.button("Analyze Content", type="primary"):
                 video_id = item['id']['videoId']
                 info = get_video_info(video_id)
                 if info:
-                    # --- CHANGE: Filter out disallowed categories ---
                     category_id = info.get('snippet', {}).get('categoryId')
                     if category_id in DISALLOWED_CATEGORIES:
                         log_message(f"🚫 Skipping video '{info['snippet']['title']}' due to disallowed category: {category_id}")
-                        continue # Move to the next video
+                        continue
 
                     transcript = get_timed_transcript(video_id)
                     details = {
@@ -239,7 +248,6 @@ if st.button("Analyze Content", type="primary"):
             log_message("⚖️ Calculating relevance scores...")
             query_embedding = model.encode(clean_text(search_query))
             for video in all_video_details:
-                # Only score videos that have a transcript
                 if video['transcript']:
                     combined_text = video['title'] + " " + video['description'] + " " + " ".join([t['text'] for t in video['transcript']])
                     content_embedding = model.encode(clean_text(combined_text))
@@ -247,7 +255,7 @@ if st.button("Analyze Content", type="primary"):
                     like_ratio = (video.get("likes", 0) / (video.get("views", 1) + 1)) * 1000
                     video["composite_score"] = (0.8 * sim_score * 100) + (0.2 * like_ratio)
                 else:
-                    video["composite_score"] = 0 # Give no score if no transcript
+                    video["composite_score"] = 0
             
             all_video_details.sort(key=lambda x: x['composite_score'], reverse=True)
             st.session_state.videos = all_video_details[:5]
@@ -256,7 +264,7 @@ if st.button("Analyze Content", type="primary"):
 if st.session_state.videos:
     st.header("🏆 Top 5 Relevant Videos")
     for i, video in enumerate(st.session_state.videos):
-        if video['composite_score'] == 0: continue # Don't show videos that couldn't be scored
+        if video['composite_score'] == 0: continue
         with st.container(border=True):
             col1, col2 = st.columns([1, 3])
             col1.image(video['thumbnail'])
