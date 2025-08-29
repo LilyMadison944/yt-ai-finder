@@ -6,6 +6,7 @@ import requests
 import string
 import yt_dlp
 from pathlib import Path
+import random
 
 # --- NLTK and SentenceTransformer Imports ---
 import nltk
@@ -49,15 +50,20 @@ if "selected_video_for_shorts" not in st.session_state:
 # --- NLTK Download Function (Crucial for Streamlit Cloud) ---
 @st.cache_resource
 def download_nltk_data():
-    """Downloads necessary NLTK models directly."""
+    """Downloads all necessary NLTK models directly."""
     try:
+        log_message("Downloading NLTK data packages...")
         nltk.download('punkt')
+        # --- FIX: Explicitly download the missing 'punkt_tab' dependency ---
+        nltk.download('punkt_tab')
         nltk.download('stopwords')
         nltk.download('wordnet')
         nltk.download('omw-1.4')
+        log_message("✅ NLTK data downloaded successfully.")
         return True
     except Exception as e:
         st.error(f"Error downloading NLTK data: {e}")
+        log_message(f"🔴 Error downloading NLTK data: {e}")
         return False
 
 # Ensure NLTK data is downloaded before the app runs
@@ -202,7 +208,7 @@ search_query = st.text_input("Enter your search query:", placeholder="e.g., how 
 
 if st.button("Analyze Content", type="primary"):
     if not nltk_data_available:
-        st.error("NLTK data could not be downloaded. The app cannot proceed.")
+        st.error("NLTK data could not be downloaded. The app cannot proceed. Please reboot the app.")
     elif not API_KEY:
         st.error("RAPIDAPI_KEY not found. Please add it to your Streamlit secrets.")
     elif not search_query:
@@ -226,8 +232,11 @@ if st.button("Analyze Content", type="primary"):
                     if category_id in DISALLOWED_CATEGORIES:
                         log_message(f"🚫 Skipping video '{info['snippet']['title']}' due to disallowed category: {category_id}")
                         continue
-
+                    
+                    # --- FIX: Add a random delay to prevent rate-limiting ---
+                    time.sleep(random.uniform(0.5, 1.5))
                     transcript = get_timed_transcript(video_id)
+                    
                     details = {
                         "video_id": video_id,
                         "title": info['snippet']['title'],
