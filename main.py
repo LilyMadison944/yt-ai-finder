@@ -18,12 +18,11 @@ from sentence_transformers import SentenceTransformer, util
 st.set_page_config(page_title="AI YouTube Content Finder", layout="wide")
 
 # Get API key from Streamlit secrets or local .env file
-# This will try to load from a local .env file if the library is installed
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass # Will fail silently if dotenv is not installed on the cloud
+    pass # Fails silently if dotenv is not installed
 
 API_KEY = os.getenv("RAPIDAPI_KEY")
 
@@ -47,24 +46,21 @@ if "videos" not in st.session_state:
 if "selected_video_for_shorts" not in st.session_state:
     st.session_state.selected_video_for_shorts = None
 
-# --- CHANGE: Simplified NLTK Download Function ---
+# --- NLTK Download Function (Crucial for Streamlit Cloud) ---
 @st.cache_resource
 def download_nltk_data():
     """Downloads necessary NLTK models directly."""
-    log_message("Downloading NLTK data packages (punkt, stopwords, wordnet)...")
     try:
         nltk.download('punkt')
         nltk.download('stopwords')
         nltk.download('wordnet')
         nltk.download('omw-1.4')
-        log_message("✅ NLTK data downloaded successfully.")
         return True
     except Exception as e:
-        log_message(f"🔴 Error downloading NLTK data: {e}")
-        st.error(f"Failed to download NLTK data: {e}")
+        st.error(f"Error downloading NLTK data: {e}")
         return False
 
-# Call the function to ensure data is downloaded
+# Ensure NLTK data is downloaded before the app runs
 nltk_data_available = download_nltk_data()
 
 # --- Load SentenceTransformer Model ---
@@ -124,15 +120,15 @@ def get_timed_transcript(video_id):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
-        
+
         vtt_file_path = next(Path("subtitles").glob(f"{video_id}.*.vtt"), None)
         if not vtt_file_path:
             log_message("🔴 VTT caption file not found.")
             return None
-        
+
         with open(vtt_file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
+
         transcript_data = []
         for i, line in enumerate(lines):
             if "-->" in line:
@@ -143,7 +139,7 @@ def get_timed_transcript(video_id):
                     transcript_data.append({"start": start_s, "text": text})
                 except (ValueError, IndexError):
                     continue
-        
+
         log_message(f"✅ Captions parsed. Segments: {len(transcript_data)}")
         os.remove(vtt_file_path)
         return transcript_data
@@ -157,13 +153,13 @@ def find_best_clips(transcript, query, clip_duration=58, num_clips=3):
 
     clean_query = clean_text(query)
     query_embedding = model.encode(clean_query, convert_to_tensor=True)
-    
+
     potential_clips = []
     for i in range(len(transcript)):
         start_time = transcript[i]['start']
         end_time = start_time + clip_duration
         current_chunk_texts = [t['text'] for t in transcript if start_time <= t['start'] < end_time and not t['text'].startswith('[')]
-        
+
         if current_chunk_texts:
             potential_clips.append({"start": start_time, "end": end_time, "transcript": " ".join(current_chunk_texts)})
 
@@ -172,19 +168,19 @@ def find_best_clips(transcript, query, clip_duration=58, num_clips=3):
     clip_texts = [clean_text(c['transcript']) for c in potential_clips]
     clip_embeddings = model.encode(clip_texts, convert_to_tensor=True)
     cosine_scores = util.cos_sim(query_embedding, clip_embeddings)
-    
+
     for i, clip in enumerate(potential_clips):
         clip['score'] = cosine_scores[0][i].item()
 
     potential_clips.sort(key=lambda x: x['score'], reverse=True)
-    
+
     final_clips = []
     for clip in potential_clips:
         if not any(max(clip['start'], fc['start']) < min(clip['end'], fc['end']) for fc in final_clips):
             final_clips.append(clip)
         if len(final_clips) == num_clips:
             break
-            
+
     log_message(f"✅ Found {len(final_clips)} potential clips.")
     return final_clips
 
@@ -204,21 +200,23 @@ with st.sidebar:
 
 search_query = st.text_input("Enter your search query:", placeholder="e.g., how to make money using rapidapi")
 
-if st.button("Analyze Content", type="primary") and nltk_data_available:
-    if not API_KEY:
+if st.button("Analyze Content", type="primary"):
+    if not nltk_data_available:
+        st.error("NLTK data could not be downloaded. The app cannot proceed.")
+    elif not API_KEY:
         st.error("RAPIDAPI_KEY not found. Please add it to your Streamlit secrets.")
     elif not search_query:
         st.error("Please enter a search query.")
     else:
         st.session_state.logs = []
         log_message("--- 🚀 Starting New Analysis ---")
-        
+
         with st.spinner("Finding and analyzing relevant videos..."):
             search_results = search_videos_api(search_query)
             if not search_results:
                 st.warning("No videos found for this query.")
                 st.stop()
-            
+
             all_video_details = []
             for item in search_results:
                 video_id = item['id']['videoId']
@@ -240,7 +238,7 @@ if st.button("Analyze Content", type="primary") and nltk_data_available:
                         "transcript": transcript
                     }
                     all_video_details.append(details)
-            
+
             if not all_video_details:
                 st.error("Could not fetch details for any relevant videos.")
                 st.stop()
@@ -256,7 +254,7 @@ if st.button("Analyze Content", type="primary") and nltk_data_available:
                     video["composite_score"] = (0.8 * sim_score * 100) + (0.2 * like_ratio)
                 else:
                     video["composite_score"] = 0
-            
+
             all_video_details.sort(key=lambda x: x['composite_score'], reverse=True)
             st.session_state.videos = all_video_details[:5]
             log_message("✅ Analysis complete. Top 5 videos identified.")
@@ -271,7 +269,7 @@ if st.session_state.videos:
             col2.subheader(f"{i+1}. {video['title']}")
             col2.caption(f"🔗 https://www.youtube.com/watch?v={video['video_id']} |  score: {video['composite_score']:.2f}")
             col2.markdown(f"👀 **Views:** {video['views']:,} | 👍 **Likes:** {video['likes']:,}")
-            
+
             if col2.button("✨ Generate Short Ideas", key=f"shorts_{video['video_id']}"):
                 st.session_state.selected_video_for_shorts = video
                 st.rerun()
@@ -281,7 +279,7 @@ if st.session_state.selected_video_for_shorts:
     st.header(f"💡 Generated Ideas for: {video['title']}")
 
     transcript_data = video['transcript']
-    
+
     with st.spinner("Finding the best clips..."):
         if transcript_data:
             clips = find_best_clips(transcript_data, search_query)
@@ -292,7 +290,7 @@ if st.session_state.selected_video_for_shorts:
                         clip_data = clips[i]
                         start_time = clip_data['start']
                         end_time = clip_data['end']
-                        
+
                         st.subheader(f"Idea #{i+1}")
                         st.image(video['thumbnail'])
                         st.markdown(f"**Timestamp:** `{time.strftime('%M:%S', time.gmtime(start_time))}` to `{time.strftime('%M:%S', time.gmtime(end_time))}`")
